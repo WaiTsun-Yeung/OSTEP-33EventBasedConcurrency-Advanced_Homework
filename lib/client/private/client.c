@@ -33,17 +33,32 @@ static int connect_server(
     }
     return connection_state;
 }
-static int run_client_event_loop(const int client_socket) {
+static int run_client_event_loop(
+    int* client_socket, const struct sockaddr_in *const server_addr
+) {
     while (true) {
         time_t current_time = 0;
-        if (
-            recv(client_socket, &current_time, sizeof(current_time), 0) 
-                == -1
-        ) {
+        const int bytes_received 
+            = recv(*client_socket, &current_time, sizeof(current_time), 0);
+        if (bytes_received == -1) {
             (void)fprintf(
                 stderr, "recv() failed: %s\n", strerror(errno)
             );
             return -7;
+        }
+        if (!bytes_received){
+            close(*client_socket);
+            *client_socket = socket(AF_INET, SOCK_STREAM, 0);
+            if (*client_socket == -1) {
+                (void)fprintf(
+                    stderr, "socket() failed: %s\n", strerror(errno)
+                );
+                return -3;
+            }
+            const int connection_state 
+                = connect_server(*client_socket, server_addr);
+            if (connection_state) return connection_state;
+            continue;
         }
         if (
             printf(
@@ -59,7 +74,7 @@ static int run_client_event_loop(const int client_socket) {
 }
 int run_client(const struct sockaddr_in *const server_addr) {
     int app_status = 0;
-    const int client_socket = socket(AF_INET, SOCK_STREAM, 0);
+    int client_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (client_socket == -1) {
         (void)fprintf(stderr, "socket() failed: %s\n", strerror(errno));
         return -3;
@@ -67,7 +82,7 @@ int run_client(const struct sockaddr_in *const server_addr) {
     if (connect_server(client_socket, server_addr) == -1) {
         (void)fprintf(stderr, "connect() failed: %s\n", strerror(errno));
         app_status = -5;
-    } else app_status = run_client_event_loop(client_socket);
+    } else app_status = run_client_event_loop(&client_socket, server_addr);
     if (close(client_socket) == -1) {
         (void)fprintf(stderr, "close() failed: %s\n", strerror(errno));
         app_status = -9;
