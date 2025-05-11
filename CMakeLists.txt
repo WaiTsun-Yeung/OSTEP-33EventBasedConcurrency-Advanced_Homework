@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.30)
 project(tcp DESCRIPTION "TCP client_lib and server_lib" LANGUAGES C)
 
 add_library(server_lib lib/server/private/server.c)
-target_include_directories(server_lib INTERFACE lib/server/public)
+target_include_directories(server_lib PUBLIC lib/server/public)
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
   target_compile_options(server_lib PUBLIC -Wall -Wextra -Werror -Wpedantic)
 endif()
