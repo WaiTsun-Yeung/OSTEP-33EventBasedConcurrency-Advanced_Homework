@@ -34,7 +34,8 @@ static int connect_server(
     return connection_state;
 }
 static int run_client_event_loop(
-    int* client_socket, const struct sockaddr_in *const server_addr
+    int *restrict client_socket, 
+    const struct sockaddr_in *restrict const server_addr
 ) {
     while (true) {
         time_t current_time = 0;

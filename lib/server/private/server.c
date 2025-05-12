@@ -116,9 +116,9 @@ static int send_message(
     return 0;
 }
 static int gather_writable_sockets(
-    struct connect_context *const connection_list,
-    fd_set *const writable_sockets,
-    int *const writeable_sockets_count
+    struct connect_context *restrict connection_list,
+    fd_set *restrict const writable_sockets,
+    int *restrict const writeable_sockets_count
 ) {
     FD_ZERO(writable_sockets);
     struct connect_context *connection = connection_list;
