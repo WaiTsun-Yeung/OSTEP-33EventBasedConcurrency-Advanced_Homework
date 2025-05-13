@@ -60,6 +60,7 @@ static int accept_new_connection(
             return -11;
         }
         new_connection->messaging_socket = messaging_socket;
+        new_connection->file = -1;
         new_connection->prev = NULL;
         if (*connection_list){
             new_connection->next = *connection_list;
@@ -77,6 +78,8 @@ static void remove_connection(
     struct connect_context **const connection_list, 
     struct connect_context *const connection
 ) {
+    close(connection->messaging_socket);
+    if (connection->file != -1) close(connection->file);
     struct connect_context *const prev_connection = connection->prev;
     struct connect_context *const next_connection = connection->next;
     if (next_connection) next_connection->prev = prev_connection;
@@ -84,14 +87,14 @@ static void remove_connection(
     else prev_connection->next = next_connection;
     free(connection);
 }
-static int send_message(
+static void send_message(
     struct connect_context **const connection_list,
     struct connect_context *const connection
 ) {
     const time_t current_time = time(NULL);
     if (current_time == -1) {
         (void)fprintf(stderr, "time() failed: %s\n", strerror(errno));
-        return -6;
+        return;
     }
     //TODO: aio read file with seek index, then add callback to send 
     //when that returns.
@@ -104,32 +107,108 @@ static int send_message(
             sizeof(current_time), 
             0
         ) > -1
-    ) return 0;
-    if (errno != ECONNRESET) {
+    ) return;
+    remove_connection(connection_list, connection);
+    if (errno == ECONNRESET) return; 
+    (void)fprintf(
+        stderr, "send() failed: fd: %d: %s\n", 
+        connection->messaging_socket, strerror(errno)
+    );
+    return;
+}
+static void open_file(
+    struct connect_context **const connection_list,
+    struct connect_context *const connection
+){
+    connection->file = open(
+        (const char *)connection->message_buffer, O_RDONLY
+    );
+    bool is_file_opened = false;
+    if (connection->file == -1) {
+        (void)fprintf(
+            stderr, "open() failed: fd: %d: %s\n", 
+            connection->messaging_socket, strerror(errno)
+        );
+        if (
+            send(
+                connection->messaging_socket, 
+                &is_file_opened, sizeof(is_file_opened), 0
+            ) == -1
+        ) (void)fprintf(
+            stderr, "send() failed: fd: %d: %s\n", 
+            connection->messaging_socket, strerror(errno)
+        );
+        (void)printf(
+            "File descriptor %d closed for file: %s\n", 
+            connection->messaging_socket, 
+            (const char *)connection->message_buffer
+        );
+        remove_connection(connection_list, connection);
+        return;
+    }
+    is_file_opened = true;
+    (void)printf(
+        "File descriptor %d opened for file: %s\n", 
+        connection->file, (const char *)connection->message_buffer
+    );
+    if (
+        send(
+            connection->messaging_socket, 
+            &is_file_opened, sizeof(is_file_opened), 0
+        ) == -1
+    ) {
         (void)fprintf(
             stderr, "send() failed: fd: %d: %s\n", 
             connection->messaging_socket, strerror(errno)
         );
-        return -8;
+        remove_connection(connection_list, connection);
+        return;
     }
-    remove_connection(connection_list, connection);
-    return 0;
+    (void)memset(
+        connection->message_buffer, 0, 
+        strlen((const char *)connection->message_buffer)
+    );
 }
-static int gather_writable_sockets(
+static void read_message(
+    struct connect_context **const connection_list,
+    struct connect_context *const connection
+) {
+    const ssize_t bytes_read = recv(
+        connection->messaging_socket, 
+        connection->message_buffer, sizeof(connection->message_buffer), 0
+    );
+    if (bytes_read == -1) {
+        (void)fprintf(
+            stderr, "recv() failed: fd: %d: %s\n", 
+            connection->messaging_socket, strerror(errno)
+        );
+        remove_connection(connection_list, connection);
+        return;
+    }
+    connection->message_buffer[bytes_read] = '\0';
+    open_file(connection_list, connection);
+    return;
+}
+static int gather_active_sockets(
     struct connect_context *restrict connection_list,
     fd_set *restrict const writable_sockets,
-    int *restrict const writeable_sockets_count
+    fd_set *restrict const readable_sockets,
+    int *restrict const active_sockets_count
 ) {
     FD_ZERO(writable_sockets);
+    FD_ZERO(readable_sockets);
     struct connect_context *connection = connection_list;
     for (
         int i = 0; 
         connection && i < FD_SETSIZE; ++i, connection = connection->next
-    ) FD_SET(connection->messaging_socket, writable_sockets);
+    ) if (connection->file == -1)
+        FD_SET(connection->messaging_socket, readable_sockets);
+    else FD_SET(connection->messaging_socket, writable_sockets);
     struct timeval timeout = { .tv_sec = 0, .tv_usec = 0 };
-    *writeable_sockets_count 
-        = select(FD_SETSIZE, NULL, writable_sockets, NULL, &timeout);
-    if (*writeable_sockets_count == -1) {
+    *active_sockets_count = select(
+        FD_SETSIZE, readable_sockets, writable_sockets, NULL, &timeout
+    );
+    if (*active_sockets_count == -1) {
         (void)fprintf(stderr, "select() failed: %s\n", strerror(errno));
         return -11;
     }
@@ -138,11 +217,13 @@ static int gather_writable_sockets(
 static void free_connections(struct connect_context *connection_list) {
     for (int i = 0; i < FD_SETSIZE && connection_list; ++i) {
         struct connect_context *const next_connection = connection_list->next;
+        close(connection_list->messaging_socket);
+        if (connection_list->file != -1) close(connection_list->file);
         free(connection_list);
         connection_list = next_connection;
     }
 }
-static int write_to_sockets(
+static void write_to_sockets(
     struct connect_context **const connection_list,
     fd_set *const writable_sockets
 ) {
@@ -154,11 +235,23 @@ static int write_to_sockets(
         connection && i < FD_SETSIZE; ++i, connection = next_connection
     ) if (FD_ISSET(connection->messaging_socket, writable_sockets)) {
         next_connection = connection->next;
-        const int app_status 
-            = send_message(connection_list, connection);
-        if (app_status) return app_status;
+        send_message(connection_list, connection);
     }
-    return 0;
+}
+static void read_from_sockets(
+    struct connect_context **const connection_list,
+    fd_set *const readable_sockets
+) {
+    struct connect_context *connection = *connection_list;
+    struct connect_context *next_connection 
+        = connection ? connection->next : NULL;
+    for (
+        int i = 0; 
+        connection && i < FD_SETSIZE; ++i, connection = next_connection
+    ) if (FD_ISSET(connection->messaging_socket, readable_sockets)) {
+        next_connection = connection->next;
+        read_message(connection_list, connection);
+    }
 }
 static int run_server_event_loop(const int listening_socket) {
     int app_status = 0;
@@ -169,14 +262,16 @@ static int run_server_event_loop(const int listening_socket) {
         );
         if (app_status) break;
         fd_set writable_sockets;
-        int writeable_sockets_count = 0;
-        app_status = gather_writable_sockets(
-            connection_list, &writable_sockets, &writeable_sockets_count
+        fd_set readable_sockets;
+        int active_sockets_count = 0;
+        app_status = gather_active_sockets(
+            connection_list, &writable_sockets, &readable_sockets, 
+            &active_sockets_count
         );
         if (app_status) break;
-        if (writeable_sockets_count == 0) continue;
-        app_status = write_to_sockets(&connection_list, &writable_sockets);
-        if (app_status) break;
+        if (active_sockets_count == 0) continue;
+        read_from_sockets(&connection_list, &readable_sockets);
+        write_to_sockets(&connection_list, &writable_sockets);
     }
     free_connections(connection_list);
     return app_status;
