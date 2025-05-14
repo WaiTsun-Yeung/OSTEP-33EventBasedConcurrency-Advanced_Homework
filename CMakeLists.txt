@@ -9,6 +9,7 @@ if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
   )
   target_link_options(server_lib PUBLIC -fsanitize=address)
 endif()
+target_link_libraries(server_lib PUBLIC rt)
 
 add_executable(server app/main.c)
 target_link_libraries(server PRIVATE server_lib)

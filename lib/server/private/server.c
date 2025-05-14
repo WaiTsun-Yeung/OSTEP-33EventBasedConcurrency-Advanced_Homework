@@ -13,6 +13,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 
+#include <signal.h>
+
 #include "connect_context.h"
 
 static int init_server(
@@ -61,6 +63,24 @@ static int accept_new_connection(
         }
         new_connection->messaging_socket = messaging_socket;
         new_connection->file = -1;
+        new_connection->async_io_control_block.aio_fildes = -1;
+        new_connection->async_io_control_block.aio_buf 
+            = new_connection->message_buffer;
+        new_connection->async_io_control_block.aio_nbytes 
+            = sizeof(new_connection->message_buffer);
+        new_connection->async_io_control_block.aio_offset = 0;
+        new_connection->async_io_control_block.aio_sigevent.sigev_notify 
+            = SIGEV_SIGNAL;
+        new_connection->async_io_control_block.aio_sigevent.sigev_signo 
+            = SIGUSR1;
+        new_connection->async_io_control_block.aio_sigevent
+            .sigev_value.sival_ptr = &new_connection;
+        new_connection->async_io_control_block.aio_sigevent
+            .sigev_notify_function = NULL;
+        new_connection->async_io_control_block.aio_sigevent
+            .sigev_notify_attributes = NULL;
+        new_connection->async_io_control_block.aio_lio_opcode = LIO_READ;
+        new_connection->async_io_control_block.aio_reqprio = 0;
         new_connection->prev = NULL;
         if (*connection_list){
             new_connection->next = *connection_list;
@@ -98,13 +118,18 @@ static void send_message(
     }
     //TODO: aio read file with seek index, then add callback to send 
     //when that returns.
+    *(time_t*)connection->message_buffer = current_time;
+    unsigned char message_buffer[sizeof(connection->message_buffer)];
+    unsigned char *byte = message_buffer;
+    for (
+        const volatile unsigned char *message_byte = connection->message_buffer;
+        message_byte < connection->message_buffer 
+            + sizeof(connection->message_buffer);
+        ++message_byte, ++byte
+    ) *byte = *message_byte;
     if (
         send(
-            connection->messaging_socket, 
-            memcpy(
-                connection->message_buffer, &current_time, sizeof(current_time)
-            ), 
-            sizeof(current_time), 
+            connection->messaging_socket, message_buffer, sizeof(current_time), 
             0
         ) > -1
     ) return;
@@ -134,10 +159,12 @@ static void open_file(
                 sizeof(is_file_opened), 0
             ) > -1
         ){
-            (void)memset(
-                connection->message_buffer, 0, 
-                strlen((const char *)connection->message_buffer)
-            );
+            for (
+                volatile unsigned char *byte = connection->message_buffer; 
+                byte < connection->message_buffer 
+                    + sizeof(connection->message_buffer); 
+                ++byte
+            ) *byte = '\0';
             return;
         } else (void)fprintf(
             stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
@@ -170,9 +197,9 @@ static void read_message(
     struct connect_context **const connection_list,
     struct connect_context *const connection
 ) {
+    unsigned char message_buffer[sizeof(connection->message_buffer)];
     const ssize_t bytes_read = recv(
-        connection->messaging_socket, 
-        connection->message_buffer, sizeof(connection->message_buffer), 0
+        connection->messaging_socket, message_buffer, sizeof(message_buffer), 0
     );
     if (bytes_read == -1) {
         (void)fprintf(
@@ -182,7 +209,14 @@ static void read_message(
         remove_connection(connection_list, connection);
         return;
     }
-    connection->message_buffer[bytes_read] = '\0';
+    volatile unsigned char *connection_message_byte 
+        = connection->message_buffer;
+    for (
+        const unsigned char *byte = message_buffer;
+        byte < message_buffer + bytes_read; 
+        ++byte, ++connection_message_byte
+    ) *connection_message_byte = *byte;
+    *connection_message_byte = '\0';
     open_file(connection_list, connection);
     return;
 }
@@ -274,7 +308,31 @@ static int run_server_event_loop(const int listening_socket) {
     return app_status;
 }
 
+static void aioSigHandler(
+    const int sig, siginfo_t *const si, void *const ucontext
+){
+    (void)ucontext;
+    (void)sig;
+    if (si->si_code == SI_ASYNCIO){}
+}
+static int init_signal_handlers(struct sigaction *sa){
+    sa->sa_handler = SIG_DFL;
+    sa->sa_flags = SA_RESTART;
+    if (sigemptyset(&sa->sa_mask) == -1) {
+        (void)fprintf(stderr, "sigemptyset() failed: %s\n", strerror(errno));
+        return -1;
+    }
+    sa->sa_flags = SA_RESTART | SA_SIGINFO;
+    sa->sa_sigaction = aioSigHandler;
+    if (sigaction(SIGUSR1, sa, NULL) == -1) {
+        (void)fprintf(stderr, "sigaction() failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 int run_server(const struct sockaddr_in *const server_addr){
+    struct sigaction sa;
+    if (init_signal_handlers(&sa)) return -1;
     const int listening_socket 
         = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (listening_socket == -1) {
