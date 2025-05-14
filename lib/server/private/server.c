@@ -120,54 +120,51 @@ static void open_file(
     struct connect_context **const connection_list,
     struct connect_context *const connection
 ){
-    connection->file = open(
-        (const char *)connection->message_buffer, O_RDONLY
-    );
+    connection->file = open((const char *)connection->message_buffer, O_RDONLY);
     bool is_file_opened = false;
-    if (connection->file == -1) {
-        (void)fprintf(
-            stderr, "open() failed: fd: %d: %s\n", 
-            connection->messaging_socket, strerror(errno)
+    if (connection->file > -1) {
+        is_file_opened = true;
+        (void)printf(
+            "File descriptor %d opened for file: %s\n", connection->file, 
+            (const char *)connection->message_buffer
         );
         if (
             send(
-                connection->messaging_socket, 
-                &is_file_opened, sizeof(is_file_opened), 0
+                connection->messaging_socket, &is_file_opened, 
+                sizeof(is_file_opened), 0
+            ) > -1
+        ){
+            (void)memset(
+                connection->message_buffer, 0, 
+                strlen((const char *)connection->message_buffer)
+            );
+            return;
+        } else (void)fprintf(
+            stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
+            strerror(errno)
+        );
+    } else {
+        (void)fprintf(
+            stderr, "open() failed: fd: %d: %s\n", connection->messaging_socket, 
+            strerror(errno)
+        );
+        if (
+            send(
+                connection->messaging_socket, &is_file_opened, 
+                sizeof(is_file_opened), 0
             ) == -1
         ) (void)fprintf(
-            stderr, "send() failed: fd: %d: %s\n", 
-            connection->messaging_socket, strerror(errno)
+            stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
+            strerror(errno)
         );
         (void)printf(
             "File descriptor %d closed for file: %s\n", 
             connection->messaging_socket, 
             (const char *)connection->message_buffer
         );
-        remove_connection(connection_list, connection);
-        return;
     }
-    is_file_opened = true;
-    (void)printf(
-        "File descriptor %d opened for file: %s\n", 
-        connection->file, (const char *)connection->message_buffer
-    );
-    if (
-        send(
-            connection->messaging_socket, 
-            &is_file_opened, sizeof(is_file_opened), 0
-        ) == -1
-    ) {
-        (void)fprintf(
-            stderr, "send() failed: fd: %d: %s\n", 
-            connection->messaging_socket, strerror(errno)
-        );
-        remove_connection(connection_list, connection);
-        return;
-    }
-    (void)memset(
-        connection->message_buffer, 0, 
-        strlen((const char *)connection->message_buffer)
-    );
+    remove_connection(connection_list, connection);
+    return;
 }
 static void read_message(
     struct connect_context **const connection_list,
