@@ -47,8 +47,7 @@ static int accept_new_connection(
         }
         if(
             fcntl(
-                messaging_socket, F_SETFL, 
-                messaging_socket_flags | O_NONBLOCK
+                messaging_socket, F_SETFL, messaging_socket_flags | O_NONBLOCK
             ) == -1
         ){
             (void)fprintf(stderr, "fcntl() failed: %s\n", strerror(errno));
@@ -62,7 +61,6 @@ static int accept_new_connection(
             return -11;
         }
         new_connection->messaging_socket = messaging_socket;
-        new_connection->file = -1;
         new_connection->async_io_control_block.aio_fildes = -1;
         new_connection->async_io_control_block.aio_buf 
             = new_connection->message_buffer;
@@ -74,13 +72,16 @@ static int accept_new_connection(
         new_connection->async_io_control_block.aio_sigevent.sigev_signo 
             = SIGUSR1;
         new_connection->async_io_control_block.aio_sigevent
-            .sigev_value.sival_ptr = &new_connection;
+            .sigev_value.sival_ptr = new_connection;
         new_connection->async_io_control_block.aio_sigevent
             .sigev_notify_function = NULL;
         new_connection->async_io_control_block.aio_sigevent
             .sigev_notify_attributes = NULL;
         new_connection->async_io_control_block.aio_lio_opcode = LIO_READ;
         new_connection->async_io_control_block.aio_reqprio = 0;
+        new_connection->is_pending_write = false;
+        new_connection->file_offset 
+            = new_connection->async_io_control_block.aio_offset;
         new_connection->prev = NULL;
         if (*connection_list){
             new_connection->next = *connection_list;
@@ -99,7 +100,8 @@ static void remove_connection(
     struct connect_context *const connection
 ) {
     close(connection->messaging_socket);
-    if (connection->file != -1) close(connection->file);
+    if (connection->async_io_control_block.aio_fildes!= -1) 
+        close(connection->async_io_control_block.aio_fildes);
     struct connect_context *const prev_connection = connection->prev;
     struct connect_context *const next_connection = connection->next;
     if (next_connection) next_connection->prev = prev_connection;
@@ -107,18 +109,18 @@ static void remove_connection(
     else prev_connection->next = next_connection;
     free(connection);
 }
+static void clear_buffer(struct connect_context *const connection) {
+    for (
+        volatile unsigned char *byte = connection->message_buffer; 
+        byte < connection->message_buffer + sizeof(connection->message_buffer); 
+        ++byte
+    ) *byte = '\0';
+}
 static void send_message(
     struct connect_context **const connection_list,
     struct connect_context *const connection
 ) {
-    const time_t current_time = time(NULL);
-    if (current_time == -1) {
-        (void)fprintf(stderr, "time() failed: %s\n", strerror(errno));
-        return;
-    }
-    //TODO: aio read file with seek index, then add callback to send 
-    //when that returns.
-    *(time_t*)connection->message_buffer = current_time;
+    connection->is_pending_write = false;
     unsigned char message_buffer[sizeof(connection->message_buffer)];
     unsigned char *byte = message_buffer;
     for (
@@ -129,29 +131,70 @@ static void send_message(
     ) *byte = *message_byte;
     if (
         send(
-            connection->messaging_socket, message_buffer, sizeof(current_time), 
-            0
+            connection->messaging_socket, message_buffer, 
+            sizeof(message_buffer), 0
         ) > -1
-    ) return;
-    remove_connection(connection_list, connection);
-    if (errno == ECONNRESET) return; 
-    (void)fprintf(
+    ) {
+        clear_buffer(connection);
+        connection->async_io_control_block.aio_offset
+            = connection->file_offset + sizeof(message_buffer);
+        connection->file_offset = connection->async_io_control_block.aio_offset;
+        if (aio_read(&connection->async_io_control_block) == -1){ 
+            if (errno != EOVERFLOW) (void)fprintf(
+                stderr, "aio_read() failed: %s\n", strerror(errno)
+            );
+        } else return;
+    } if (errno != ECONNRESET) (void)fprintf(
         stderr, "send() failed: fd: %d: %s\n", 
         connection->messaging_socket, strerror(errno)
     );
-    return;
+    remove_connection(connection_list, connection);
+}
+static void fail_open_file(
+    struct connect_context *const connection, const char *const message_buffer
+) {
+    (void)fprintf(
+        stderr, "open() failed: fd: %d: %s\n", connection->messaging_socket, 
+        strerror(errno)
+    );
+    const bool is_file_opened = false;
+    if (
+        send(
+            connection->messaging_socket, &is_file_opened, 
+            sizeof(is_file_opened), 0
+        ) == -1
+    ) (void)fprintf(
+        stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
+        strerror(errno)
+    );
+    (void)printf(
+        "File descriptor %d closed for file: %s\n", 
+        connection->messaging_socket, message_buffer
+    );
 }
 static void open_file(
     struct connect_context **const connection_list,
     struct connect_context *const connection
 ){
-    connection->file = open((const char *)connection->message_buffer, O_RDONLY);
-    bool is_file_opened = false;
-    if (connection->file > -1) {
-        is_file_opened = true;
+    unsigned char message_buffer[sizeof(connection->message_buffer)];
+    unsigned char *byte = message_buffer;
+    for (
+        const volatile unsigned char *message_byte = connection->message_buffer;
+        message_byte 
+            < connection->message_buffer + sizeof(connection->message_buffer);
+        ++message_byte, ++byte
+    ) if (*message_byte == '\0') {
+        *byte = '\0';
+        break;
+    } else *byte = *message_byte;
+    connection->async_io_control_block.aio_fildes 
+        = open((const char *)message_buffer, O_RDONLY);
+    if (connection->async_io_control_block.aio_fildes > -1) {
+        const bool is_file_opened = true;
         (void)printf(
-            "File descriptor %d opened for file: %s\n", connection->file, 
-            (const char *)connection->message_buffer
+            "File descriptor %d opened for file: %s\n", 
+            connection->async_io_control_block.aio_fildes, 
+            (const char *)message_buffer
         );
         if (
             send(
@@ -159,37 +202,17 @@ static void open_file(
                 sizeof(is_file_opened), 0
             ) > -1
         ){
-            for (
-                volatile unsigned char *byte = connection->message_buffer; 
-                byte < connection->message_buffer 
-                    + sizeof(connection->message_buffer); 
-                ++byte
-            ) *byte = '\0';
-            return;
+            clear_buffer(connection);
+            if (aio_read(&connection->async_io_control_block) == -1) 
+                (void)fprintf(
+                    stderr, "aio_read() failed: %s\n", strerror(errno)
+                );
+            else return;
         } else (void)fprintf(
             stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
             strerror(errno)
         );
-    } else {
-        (void)fprintf(
-            stderr, "open() failed: fd: %d: %s\n", connection->messaging_socket, 
-            strerror(errno)
-        );
-        if (
-            send(
-                connection->messaging_socket, &is_file_opened, 
-                sizeof(is_file_opened), 0
-            ) == -1
-        ) (void)fprintf(
-            stderr, "send() failed: fd: %d: %s\n", connection->messaging_socket, 
-            strerror(errno)
-        );
-        (void)printf(
-            "File descriptor %d closed for file: %s\n", 
-            connection->messaging_socket, 
-            (const char *)connection->message_buffer
-        );
-    }
+    } else fail_open_file(connection, (const char *)message_buffer);
     remove_connection(connection_list, connection);
     return;
 }
@@ -232,7 +255,7 @@ static int gather_active_sockets(
     for (
         int i = 0; 
         connection && i < FD_SETSIZE; ++i, connection = connection->next
-    ) if (connection->file == -1)
+    ) if (connection->async_io_control_block.aio_fildes == -1)
         FD_SET(connection->messaging_socket, readable_sockets);
     else FD_SET(connection->messaging_socket, writable_sockets);
     struct timeval timeout = { .tv_sec = 0, .tv_usec = 0 };
@@ -249,7 +272,8 @@ static void free_connections(struct connect_context *connection_list) {
     for (int i = 0; i < FD_SETSIZE && connection_list; ++i) {
         struct connect_context *const next_connection = connection_list->next;
         close(connection_list->messaging_socket);
-        if (connection_list->file != -1) close(connection_list->file);
+        if (connection_list->async_io_control_block.aio_fildes != -1) 
+            close(connection_list->async_io_control_block.aio_fildes);
         free(connection_list);
         connection_list = next_connection;
     }
@@ -266,7 +290,13 @@ static void write_to_sockets(
         connection && i < FD_SETSIZE; ++i, connection = next_connection
     ) if (FD_ISSET(connection->messaging_socket, writable_sockets)) {
         next_connection = connection->next;
-        send_message(connection_list, connection);
+        if (connection->is_pending_write){
+            if (!*(volatile unsigned char*)connection->message_buffer){
+                remove_connection(connection_list, connection);
+                continue;
+            }
+            send_message(connection_list, connection);
+        }
     }
 }
 static void read_from_sockets(
@@ -307,16 +337,18 @@ static int run_server_event_loop(const int listening_socket) {
     free_connections(connection_list);
     return app_status;
 }
-
 static void aioSigHandler(
     const int sig, siginfo_t *const si, void *const ucontext
 ){
     (void)ucontext;
     (void)sig;
-    if (si->si_code == SI_ASYNCIO){}
+    if (sig == SIGUSR1 && si->si_code == SI_ASYNCIO) {
+        struct connect_context *const connection 
+            = (struct connect_context *)si->si_value.sival_ptr;
+        connection->is_pending_write = true;
+    }
 }
 static int init_signal_handlers(struct sigaction *sa){
-    sa->sa_handler = SIG_DFL;
     sa->sa_flags = SA_RESTART;
     if (sigemptyset(&sa->sa_mask) == -1) {
         (void)fprintf(stderr, "sigemptyset() failed: %s\n", strerror(errno));
